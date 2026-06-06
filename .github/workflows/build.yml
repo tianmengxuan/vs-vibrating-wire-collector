@@ -1,0 +1,30 @@
+name: Windows 打包
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: PyInstaller 打包
+        run: |
+          pyinstaller --onefile --clean --name "VS振弦数据采集器" main.py
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: VS振弦数据采集器
+          path: dist/VS振弦数据采集器.exe

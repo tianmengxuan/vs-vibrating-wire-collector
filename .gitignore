@@ -1,0 +1,29 @@
+# 编译产物
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc
+*.pyo
+
+# 日志
+日志/
+logs/
+*.log.*
+
+# 配置（含敏感信息）
+config.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 临时文件
+*.tmp
+t2.txt
+
+# macOS
+.DS_Store
