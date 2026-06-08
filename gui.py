@@ -49,6 +49,8 @@ class VSCollectorGUI:
         self.devices = {}
         self.site_names = {}
         self.device_formulas = {}  # {udid: {str(ch): {K,f0,alpha,T0,elev}}}
+        self._tree_sort_column = None
+        self._tree_sort_desc = False
         self.log_count = 0
         self.data_count = 0
         # 垃圾UDID黑名单（协议名/HTTP标识等不得作为设备ID显示）
@@ -112,21 +114,26 @@ class VSCollectorGUI:
         tf.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 0))
 
         cols = ('udid','site','status','ip','signal','voltage','packets','freq','temp','calc','water','water_elevation','quality','refresh_time')
+        self._tree_columns = cols
+        self._tree_heading_texts = {
+            'udid': '设备ID',
+            'site': '站点名称',
+            'status': '状态',
+            'ip': 'IP',
+            'signal': '信号(dBm)',
+            'voltage': '电压(V)',
+            'packets': '数据包',
+            'freq': '频率(Hz)',
+            'temp': '温度(℃)',
+            'calc': 'P水压(MPa)',
+            'water': '水位(m)',
+            'water_elevation': '水位高程(m)',
+            'quality': '数据质量',
+            'refresh_time': '刷新时间',
+        }
+        self._numeric_sort_columns = {'signal', 'voltage', 'packets', 'freq', 'temp', 'calc', 'water', 'water_elevation'}
         self.tree = ttk.Treeview(tf, columns=cols, show='headings', height=16)
-        self.tree.heading('udid', text='设备ID')
-        self.tree.heading('site', text='站点名称')
-        self.tree.heading('status', text='状态')
-        self.tree.heading('ip', text='IP')
-        self.tree.heading('signal', text='信号(dBm)')
-        self.tree.heading('voltage', text='电压(V)')
-        self.tree.heading('packets', text='数据包')
-        self.tree.heading('freq', text='频率(Hz)')
-        self.tree.heading('temp', text='温度(℃)')
-        self.tree.heading('calc', text='P水压(MPa)')
-        self.tree.heading('water', text='水位(m)')
-        self.tree.heading('water_elevation', text='水位高程(m)')
-        self.tree.heading('quality', text='数据质量')
-        self.tree.heading('refresh_time', text='刷新时间')
+        self._update_tree_headings()
 
         w = {'udid':85,'site':105,'status':42,'ip':120,'signal':55,'voltage':55,'packets':48,
              'freq':75,'temp':65,'calc':85,'water':80,'water_elevation':90,'quality':48,'refresh_time':160}
@@ -453,6 +460,69 @@ class VSCollectorGUI:
     # ================================================================
     # 表格
     # ================================================================
+    def _update_tree_headings(self):
+        for col in self._tree_columns:
+            text = self._tree_heading_texts[col]
+            if col == self._tree_sort_column:
+                text = f'{text} {"↓" if self._tree_sort_desc else "↑"}'
+            self.tree.heading(col, text=text, command=lambda c=col: self._sort_tree_by_column(c))
+
+    def _sort_tree_by_column(self, col):
+        if col == self._tree_sort_column:
+            self._tree_sort_desc = not self._tree_sort_desc
+        else:
+            self._tree_sort_column = col
+            self._tree_sort_desc = False
+        self._apply_tree_sort()
+        self._update_tree_headings()
+
+    def _apply_tree_sort(self):
+        col = self._tree_sort_column
+        if not col:
+            return
+
+        rows = []
+        for iid in self.tree.get_children(''):
+            raw = self.tree.set(iid, col)
+            ok, value, fallback = self._tree_sort_value(col, raw)
+            rows.append((iid, ok, value, fallback))
+
+        valid_rows = [row for row in rows if row[1]]
+        fallback_rows = [row for row in rows if not row[1]]
+        valid_rows.sort(key=lambda row: row[2], reverse=self._tree_sort_desc)
+        fallback_rows.sort(key=lambda row: row[3])
+
+        for index, row in enumerate(valid_rows + fallback_rows):
+            self.tree.move(row[0], '', index)
+
+    def _tree_sort_value(self, col, raw):
+        text = str(raw).strip()
+        fallback = text.casefold()
+
+        if col in self._numeric_sort_columns:
+            try:
+                return True, float(text.replace(',', '')), fallback
+            except ValueError:
+                return False, None, fallback
+
+        if col == 'refresh_time':
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S',
+                        '%Y-%m-%d %H:%M', '%Y/%m/%d %H:%M', '%H:%M:%S'):
+                try:
+                    return True, datetime.strptime(text, fmt), fallback
+                except ValueError:
+                    pass
+            return False, None, fallback
+
+        if col == 'status':
+            if '在线' in text and '离线' not in text:
+                return True, 0, fallback
+            if '离线' in text:
+                return True, 1, fallback
+            return False, None, fallback
+
+        return True, fallback, fallback
+
     def _on_row_dblclick(self, event):
         col = self.tree.identify_column(event.x)
         item = self.tree.identify_row(event.y)
@@ -477,6 +547,7 @@ class VSCollectorGUI:
             if nw != old:
                 self.site_names[udid] = nw
                 self.tree.set(udid, 'site', nw)
+                self._apply_tree_sort()
                 self._save_site_names()
                 self._log('INFO', f'站点: {udid} → {nw}')
             e.destroy()
@@ -506,6 +577,7 @@ class VSCollectorGUI:
             self.devices[udid]['addr'] = addr or self.devices[udid].get('addr', '-')
             self.tree.set(udid, 'status', '● 在线')
             self.tree.set(udid, 'ip', addr or '-')
+        self._apply_tree_sort()
         self._update_combo()
         self.st_online.configure(text=f'在线: {sum(1 for d in self.devices.values() if d.get("online"))}')
 
@@ -513,6 +585,7 @@ class VSCollectorGUI:
         if udid in self.devices:
             self.devices[udid]['online'] = False
             self.tree.set(udid, 'status', '○ 离线')
+            self._apply_tree_sort()
             self._log('WARN', f'设备离线: {udid}')
         self.st_online.configure(text=f'在线: {sum(1 for d in self.devices.values() if d.get("online"))}')
 
@@ -637,6 +710,7 @@ class VSCollectorGUI:
         )
         try:
             self.tree.item(udid, values=vals)
+            self._apply_tree_sort()
         except:
             pass
 
