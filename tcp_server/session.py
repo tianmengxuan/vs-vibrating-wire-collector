@@ -21,6 +21,9 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+READ_TIMEOUT_SECONDS = 60
+IDLE_TIMEOUT_SECONDS = 3600
+
 
 # HTTP请求 / 非设备流量特征关键词（接收到这些直接丢弃）
 _NON_DEVICE_PATTERNS = [
@@ -238,20 +241,20 @@ class DeviceSession:
         """
         logger.info("开始接收数据 [%s:%d]", self.addr[0], self.addr[1])
 
-        _idle_counter = 0
+        last_received_at = time.monotonic()
 
         try:
             while self._running:
                 try:
                     # 读取数据块
                     chunk = await asyncio.wait_for(
-                        self.reader.read(4096), timeout=60
+                        self.reader.read(4096), timeout=READ_TIMEOUT_SECONDS
                     )
                 except asyncio.TimeoutError:
-                    # 60秒无数据，累加空闲计数
-                    _idle_counter += 1
-                    if _idle_counter >= 10:
-                        logger.warning("设备空闲超时 [%s]: 10分钟无数据，主动断开", self.udid or f"{self.addr[0]}:{self.addr[1]}")
+                    # 连续无数据达到阈值后主动断开
+                    idle_seconds = time.monotonic() - last_received_at
+                    if idle_seconds >= IDLE_TIMEOUT_SECONDS:
+                        logger.warning("设备空闲超时 [%s]: 1小时无数据，主动断开", self.udid or f"{self.addr[0]}:{self.addr[1]}")
                         break
                     continue
 
@@ -261,7 +264,7 @@ class DeviceSession:
                     break
 
                 self.last_activity = time.time()
-                _idle_counter = 0
+                last_received_at = time.monotonic()
 
                 # 快速过滤非设备流量（HTTP爬虫等）— 丢弃后不追加到缓冲区
                 if self._looks_like_non_device(chunk):
