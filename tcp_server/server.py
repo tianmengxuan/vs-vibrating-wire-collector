@@ -29,6 +29,15 @@ _GARBAGE_UDID_PREFIXES = ('UNKNOWN', 'SL651_', 'HTTP_', 'HTTPS_', 'SSL_')
 _VALID_UDID_RE = re.compile(r'^[A-Za-z0-9_\-]{2,32}$')
 
 
+def _is_valid_device_udid(udid):
+    """Return True when udid is safe to treat as a real device ID."""
+    if not isinstance(udid, str) or udid in ('', 'UNKNOWN', 'UNKNOWN_DEVICE'):
+        return False
+    if any(udid.startswith(p) for p in _GARBAGE_UDID_PREFIXES):
+        return False
+    return bool(_VALID_UDID_RE.match(udid))
+
+
 class TCPServer:
     """
     TCP异步服务端。
@@ -210,23 +219,21 @@ class TCPServer:
 
             # 更新UDID（排除垃圾UDID和乱码）
             parsed_udid = parse_result.get('udid', '')
-            if parsed_udid and parsed_udid not in ('', 'UNKNOWN', 'UNKNOWN_DEVICE'):
-                if not any(parsed_udid.startswith(p) for p in _GARBAGE_UDID_PREFIXES):
-                    # 额外正则校验：UDID必须为合法格式（字母数字_-，2~32字符）
-                    if _VALID_UDID_RE.match(parsed_udid):
-                        if not session.udid:
-                            session.set_udid(parsed_udid)
-                            await self._register_session(session)
-                            udid = parsed_udid
-                    else:
-                        logger.warning("过滤乱码UDID: %s... (协议=%s)",
-                                      parsed_udid[:20], parse_result.get('protocol'))
+            if _is_valid_device_udid(parsed_udid):
+                if not session.udid:
+                    session.set_udid(parsed_udid)
+                    await self._register_session(session)
+                    udid = parsed_udid
+            elif isinstance(parsed_udid, str) and parsed_udid not in ('', 'UNKNOWN', 'UNKNOWN_DEVICE') and not any(
+                    parsed_udid.startswith(p) for p in _GARBAGE_UDID_PREFIXES):
+                logger.warning("过滤乱码UDID: %s... (协议=%s)",
+                              parsed_udid[:20], parse_result.get('protocol'))
 
             # ---- 步骤2: 原始数据包入库（仅有效UDID） ----
             raw_packet_id = None
             if self.db and self.db.is_connected():
-                if udid not in ('', 'UNKNOWN', 'UNKNOWN_DEVICE') and not any(
-                        udid.startswith(p) for p in _GARBAGE_UDID_PREFIXES):
+                if _is_valid_device_udid(udid):
+                    self.db.update_device_online_status(udid, True)
                     raw_packet_id = self.db.insert_raw_packet(
                         udid=udid,
                         raw_frame_hex=parse_result['raw_packet'].get('raw_hex', ''),
@@ -295,38 +302,37 @@ class TCPServer:
                 logger.info("解算完成 [%s]: %d/%d 条成功", udid, saved_count, len(channels))
 
             # ---- 步骤5.5: 推送给GUI（仅有效设备） ----
-            if self.gui_data_callback and udid not in ('', 'UNKNOWN', 'UNKNOWN_DEVICE'):
-                if not any(udid.startswith(p) for p in _GARBAGE_UDID_PREFIXES):
-                    try:
-                        gui_channels = []
-                        for i, ch in enumerate(channels):
-                            ch_data = {
-                                'channel': ch.get('channel', 0),
-                                'frequency': ch.get('frequency'),
-                                'temp': ch.get('temp') or ch.get('temperature'),
-                                'freq_module': ch.get('freq_module') or ch.get('frequency_module'),
-                                'thermistor_r': ch.get('thermistor_r'),
-                                'data_quality': ch.get('data_quality', 'VALID'),
-                            }
-                            if i < len(calc_results):
-                                cr = calc_results[i]
-                                ch_data['calc_value'] = cr.get('calc_value')
-                                ch_data['calc_unit'] = cr.get('calc_unit')
-                                ch_data['sensor_type'] = cr.get('sensor_type')
-                            gui_channels.append(ch_data)
+            if self.gui_data_callback and _is_valid_device_udid(udid):
+                try:
+                    gui_channels = []
+                    for i, ch in enumerate(channels):
+                        ch_data = {
+                            'channel': ch.get('channel', 0),
+                            'frequency': ch.get('frequency'),
+                            'temp': ch.get('temp') or ch.get('temperature'),
+                            'freq_module': ch.get('freq_module') or ch.get('frequency_module'),
+                            'thermistor_r': ch.get('thermistor_r'),
+                            'data_quality': ch.get('data_quality', 'VALID'),
+                        }
+                        if i < len(calc_results):
+                            cr = calc_results[i]
+                            ch_data['calc_value'] = cr.get('calc_value')
+                            ch_data['calc_unit'] = cr.get('calc_unit')
+                            ch_data['sensor_type'] = cr.get('sensor_type')
+                        gui_channels.append(ch_data)
 
-                        self.gui_data_callback(udid, {
-                            'signal': parse_result.get('signal'),
-                            'voltage': parse_result.get('voltage') or parse_result.get('battery_voltage'),
-                            'channels': gui_channels,
-                            'raw_hex': parse_result['raw_packet'].get('raw_hex', ''),
-                            'raw_str': parse_result['raw_packet'].get('raw_str', ''),
-                            'protocol': parse_result.get('protocol', ''),
-                            'data_len': len(data),
-                            'addr': f"{session.addr[0]}:{session.addr[1]}",
-                        })
-                    except Exception as gui_err:
-                        logger.debug("GUI回调异常: %s", gui_err)
+                    self.gui_data_callback(udid, {
+                        'signal': parse_result.get('signal'),
+                        'voltage': parse_result.get('voltage') or parse_result.get('battery_voltage'),
+                        'channels': gui_channels,
+                        'raw_hex': parse_result['raw_packet'].get('raw_hex', ''),
+                        'raw_str': parse_result['raw_packet'].get('raw_str', ''),
+                        'protocol': parse_result.get('protocol', ''),
+                        'data_len': len(data),
+                        'addr': f"{session.addr[0]}:{session.addr[1]}",
+                    })
+                except Exception as gui_err:
+                    logger.debug("GUI回调异常: %s", gui_err)
 
             # ---- 步骤6: 更新解析状态 ----
             if self.db and self.db.is_connected() and raw_packet_id:
