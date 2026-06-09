@@ -12,6 +12,9 @@ import os, json, time, queue, threading, asyncio, traceback, tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
 
+RECENT_DATA_ONLINE_SECONDS = 3600
+STALE_DEVICE_CHECK_MS = 30000
+
 class GuiLogHandler:
     def __init__(self, q):
         self.q = q
@@ -63,6 +66,7 @@ class VSCollectorGUI:
         self._setup_window()
         self._build_ui()
         self._start_msg_processor()
+        self._start_stale_device_checker()
         self._log('INFO', 'GUI v4.3 已启动')
 
     def _setup_window(self):
@@ -579,15 +583,19 @@ class VSCollectorGUI:
             self.tree.set(udid, 'ip', addr or '-')
         self._apply_tree_sort()
         self._update_combo()
-        self.st_online.configure(text=f'在线: {sum(1 for d in self.devices.values() if d.get("online"))}')
+        self._update_online_count()
 
     def _dev_offline(self, udid):
         if udid in self.devices:
-            self.devices[udid]['online'] = False
-            self.tree.set(udid, 'status', '○ 离线')
-            self._apply_tree_sort()
-            self._log('WARN', f'设备离线: {udid}')
-        self.st_online.configure(text=f'在线: {sum(1 for d in self.devices.values() if d.get("online"))}')
+            dev = self.devices[udid]
+            if self._has_recent_data(dev):
+                dev['online'] = True
+                self.tree.set(udid, 'status', '● 在线')
+                self._apply_tree_sort()
+                self._log('INFO', f'TCP断开但1小时内有数据，保持在线: {udid}')
+            else:
+                self._mark_device_offline(udid)
+        self._update_online_count()
 
     def _dev_data(self, udid, data):
         # 清理末尾冒号/分号
@@ -682,8 +690,10 @@ class VSCollectorGUI:
             self._log('INFO', f'  └ CH{cn}: {", ".join(parts)} [{q}]')
 
         # 记录刷新时间（含年月日）
-        refresh_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        now = datetime.now()
+        refresh_ts = now.strftime('%Y-%m-%d %H:%M:%S')
         dev['refresh_time'] = refresh_ts
+        dev['last_data_time'] = now
 
         def fs(v, d=1):
             return f'{v:.{d}f}' if isinstance(v, (int, float)) else '-'
@@ -713,6 +723,7 @@ class VSCollectorGUI:
             self._apply_tree_sort()
         except:
             pass
+        self._update_online_count()
 
         # 第三方监控快照入库
         if self.db_manager and self.db_manager.is_connected():
@@ -734,6 +745,63 @@ class VSCollectorGUI:
                 self._log('INFO', f'入库成功: {udid} P水压={ch1.get("calc")} 水位={ch1.get("water")}')
             except Exception as e:
                 self._log('ERROR', f'入库失败 {udid}: {e}')
+
+    def _update_online_count(self):
+        self.st_online.configure(text=f'在线: {sum(1 for d in self.devices.values() if d.get("online"))}')
+
+    def _device_last_data_time(self, dev):
+        last_data_time = dev.get('last_data_time')
+        if isinstance(last_data_time, datetime):
+            return last_data_time
+
+        refresh_time = dev.get('refresh_time')
+        if isinstance(refresh_time, str) and refresh_time and refresh_time != '-':
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S',
+                        '%Y-%m-%d %H:%M', '%Y/%m/%d %H:%M', '%H:%M:%S'):
+                try:
+                    parsed = datetime.strptime(refresh_time, fmt)
+                    if fmt == '%H:%M:%S':
+                        parsed = parsed.replace(
+                            year=datetime.now().year,
+                            month=datetime.now().month,
+                            day=datetime.now().day,
+                        )
+                    return parsed
+                except ValueError:
+                    pass
+        return None
+
+    def _has_recent_data(self, dev, now=None):
+        last_data_time = self._device_last_data_time(dev)
+        if last_data_time is None:
+            return False
+        now = now or datetime.now()
+        return (now - last_data_time).total_seconds() < RECENT_DATA_ONLINE_SECONDS
+
+    def _mark_device_offline(self, udid):
+        self.devices[udid]['online'] = False
+        self.tree.set(udid, 'status', '○ 离线')
+        self._apply_tree_sort()
+        self._log('WARN', f'设备离线: {udid}')
+
+    def _start_stale_device_checker(self):
+        self._expire_stale_devices()
+
+    def _expire_stale_devices(self):
+        now = datetime.now()
+        changed = False
+        for udid, dev in list(self.devices.items()):
+            if dev.get('online') and self._device_last_data_time(dev) and not self._has_recent_data(dev, now):
+                dev['online'] = False
+                self.tree.set(udid, 'status', '○ 离线')
+                self._log('WARN', f'设备超过1小时无数据，标记离线: {udid}')
+                changed = True
+
+        if changed:
+            self._apply_tree_sort()
+            self._update_online_count()
+
+        self.root.after(STALE_DEVICE_CHECK_MS, self._expire_stale_devices)
 
     def _update_combo(self):
         self.cmd_udid['values'] = sorted(self.devices.keys())

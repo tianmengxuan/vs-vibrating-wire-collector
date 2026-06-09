@@ -18,7 +18,7 @@ import logging
 import re
 from datetime import datetime
 
-from .session import DeviceSession
+from .session import DeviceSession, IDLE_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,8 @@ class TCPServer:
         self._running = False
         self.gui_data_callback = None  # GUI数据回调 (udid, data_dict) -> None
         self._on_device_connect = None  # GUI上线通知 (udid, addr) -> None
+        self._last_data_seen = {}
+        self._offline_tasks = {}
 
         logger.info("TCP服务端初始化: %s:%d", host, port)
 
@@ -231,6 +233,11 @@ class TCPServer:
 
             # ---- 步骤2: 原始数据包入库（仅有效UDID） ----
             raw_packet_id = None
+            if _is_valid_device_udid(udid):
+                self._last_data_seen[udid] = datetime.now()
+                old_task = self._offline_tasks.pop(udid, None)
+                if old_task and not old_task.done():
+                    old_task.cancel()
             if self.db and self.db.is_connected():
                 if _is_valid_device_udid(udid):
                     self.db.update_device_online_status(udid, True)
@@ -361,8 +368,57 @@ class TCPServer:
         await self._unregister_session(session)
 
         # 更新数据库状态
+        last_seen = self._last_data_seen.get(udid)
+        if last_seen and self._has_recent_data(last_seen):
+            self._schedule_stale_offline(udid, last_seen)
+            logger.info("设备断开但1小时内有数据，暂不标记离线: %s", udid)
+            return
+
         if self.db and self.db.is_connected():
             self.db.update_device_online_status(udid, False)
+
+    @staticmethod
+    def _has_recent_data(last_seen, now=None):
+        now = now or datetime.now()
+        return (now - last_seen).total_seconds() < IDLE_TIMEOUT_SECONDS
+
+    @staticmethod
+    def _seconds_until_stale(last_seen, now=None):
+        now = now or datetime.now()
+        elapsed = (now - last_seen).total_seconds()
+        return max(0, IDLE_TIMEOUT_SECONDS - elapsed)
+
+    def _schedule_stale_offline(self, udid, last_seen):
+        old_task = self._offline_tasks.get(udid)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        self._offline_tasks[udid] = asyncio.create_task(
+            self._mark_offline_when_stale(udid, last_seen)
+        )
+
+    async def _mark_offline_when_stale(self, udid, expected_last_seen):
+        try:
+            delay = self._seconds_until_stale(expected_last_seen)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            if self._last_data_seen.get(udid) != expected_last_seen:
+                return
+
+            async with self._sessions_lock:
+                if udid in self.device_sessions:
+                    return
+
+            if self.db and self.db.is_connected():
+                self.db.update_device_online_status(udid, False)
+                logger.info("设备超过1小时无数据，标记离线: %s", udid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("延迟离线检查异常 [%s]: %s", udid, e)
+        finally:
+            if self._offline_tasks.get(udid) is asyncio.current_task():
+                self._offline_tasks.pop(udid, None)
 
     # ====================================================================
     # 服务启停
@@ -411,6 +467,9 @@ class TCPServer:
         """
         logger.info("正在停止TCP服务端...")
         self._running = False
+        for task in list(self._offline_tasks.values()):
+            task.cancel()
+        self._offline_tasks.clear()
 
         # 关闭所有设备会话
         async with self._sessions_lock:
