@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
     steps:
       - uses: actions/checkout@v4
 
@@ -19,12 +22,218 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 运行单元测试
+        run: python -m unittest discover -s tests -p "test_*.py"
+
       - name: PyInstaller 打包
         run: |
-          pyinstaller --onefile --clean --name "VS振弦数据采集器" main.py
+          $ErrorActionPreference = 'Stop'
+          $appName = 'VS' + (-join [char[]](0x632f, 0x5f26, 0x6570, 0x636e, 0x91c7, 0x96c6, 0x5668))
+          python -m PyInstaller --onefile --clean --name $appName main.py
+          $exePath = Join-Path 'dist' ($appName + '.exe')
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+            throw "PyInstaller did not create expected EXE: $exePath"
+          }
+          if ((Get-Item -LiteralPath $exePath).Length -le 0) {
+            throw "PyInstaller created a zero-byte EXE: $exePath"
+          }
+
+      - name: 无损升级烟测
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Join-Chars {
+            param([int[]]$Codes)
+            return -join [char[]]$Codes
+          }
+
+          function Stop-TestProcess {
+            param([string]$TargetExePath)
+
+            $target = [System.IO.Path]::GetFullPath($TargetExePath).TrimEnd('\')
+            $processes = @(
+              Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                $_.ExecutablePath -and
+                ([System.IO.Path]::GetFullPath($_.ExecutablePath).TrimEnd('\') -ieq $target)
+              }
+            )
+
+            foreach ($process in $processes) {
+              Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          $appName = 'VS' + (Join-Chars @(0x632f, 0x5f26, 0x6570, 0x636e, 0x91c7, 0x96c6, 0x5668))
+          $newSuffix = Join-Chars @(0x65b0, 0x7248)
+          $appExeName = $appName + '.exe'
+          $payloadExeName = $appName + '_' + $newSuffix + '.exe'
+          $builtExe = Join-Path (Resolve-Path 'dist').Path $appExeName
+          if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
+            throw "Missing built EXE for smoke test: $builtExe"
+          }
+
+          $smokeRoot = Join-Path $env:RUNNER_TEMP ('vs-upgrade-smoke-' + [guid]::NewGuid().ToString('N'))
+          $smokeDir = Join-Path $smokeRoot ('windows ' + (Join-Chars @(0x4e2d, 0x6587, 0x8def, 0x5f84)))
+          New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null
+
+          $currentExe = Join-Path $smokeDir $appExeName
+          $payloadExe = Join-Path $smokeDir $payloadExeName
+          Copy-Item -LiteralPath $builtExe -Destination $currentExe -Force
+          Copy-Item -LiteralPath $builtExe -Destination $payloadExe -Force
+          Copy-Item -LiteralPath 'windows_upgrade\upgrade_vs_collector.ps1' -Destination $smokeDir -Force
+          Copy-Item -LiteralPath 'windows_upgrade\upgrade_vs_collector.cmd' -Destination $smokeDir -Force
+
+          $siteName = Join-Chars @(0x6d4b, 0x8bd5, 0x7ad9, 0x70b9)
+          $note = Join-Chars @(0x4e2d, 0x6587, 0x914d, 0x7f6e, 0x5185, 0x5bb9)
+          $formulaName = Join-Chars @(0x632f, 0x5f26, 0x516c, 0x5f0f)
+
+          Set-Content -LiteralPath (Join-Path $smokeDir 'config.env') -Encoding UTF8 -Value @(
+            "SITE_NAME=$siteName",
+            "NOTE=$note"
+          )
+          Set-Content -LiteralPath (Join-Path $smokeDir 'sites.json') -Encoding UTF8 -Value (
+            '[{"id":"S001","name":"' + $siteName + '","note":"' + $note + '"}]'
+          )
+          Set-Content -LiteralPath (Join-Path $smokeDir 'formulas.json') -Encoding UTF8 -Value (
+            '[{"name":"' + $formulaName + '","expr":"x+1","note":"' + $note + '"}]'
+          )
+
+          $configNames = @('config.env', 'sites.json', 'formulas.json')
+          $beforeHashes = @{}
+          foreach ($name in $configNames) {
+            $beforeHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $smokeDir $name) -Algorithm SHA256).Hash
+          }
+          $oldExeHash = (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash
+
+          try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $smokeDir 'upgrade_vs_collector.ps1')
+            if ($LASTEXITCODE -ne 0) {
+              throw "Upgrade smoke test failed with exit code $LASTEXITCODE"
+            }
+
+            Start-Sleep -Seconds 2
+
+            if (-not (Test-Path -LiteralPath $currentExe -PathType Leaf)) {
+              throw "Upgraded EXE is missing: $currentExe"
+            }
+            if ((Get-Item -LiteralPath $currentExe).Length -le 0) {
+              throw "Upgraded EXE is zero bytes: $currentExe"
+            }
+
+            foreach ($name in $configNames) {
+              $afterHash = (Get-FileHash -LiteralPath (Join-Path $smokeDir $name) -Algorithm SHA256).Hash
+              if ($afterHash -ne $beforeHashes[$name]) {
+                throw "Config file changed during upgrade: $name"
+              }
+            }
+
+            $backupDirs = @(Get-ChildItem -LiteralPath $smokeDir -Directory -Filter 'upgrade_backup_*')
+            if ($backupDirs.Count -lt 1) {
+              throw 'Upgrade did not create an upgrade_backup_* directory.'
+            }
+            $backupDir = $backupDirs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+            $backupRequiredNames = @($appExeName) + $configNames
+            foreach ($name in $backupRequiredNames) {
+              $backupPath = Join-Path $backupDir.FullName $name
+              if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+                throw "Missing backup file: $backupPath"
+              }
+            }
+            if ((Get-Item -LiteralPath (Join-Path $backupDir.FullName $appExeName)).Length -le 0) {
+              throw 'Backup EXE is zero bytes.'
+            }
+            $backupExeHash = (Get-FileHash -LiteralPath (Join-Path $backupDir.FullName $appExeName) -Algorithm SHA256).Hash
+            if ($backupExeHash -ne $oldExeHash) {
+              throw 'Backup EXE hash does not match the original old EXE.'
+            }
+            foreach ($name in $configNames) {
+              $backupConfigHash = (Get-FileHash -LiteralPath (Join-Path $backupDir.FullName $name) -Algorithm SHA256).Hash
+              if ($backupConfigHash -ne $beforeHashes[$name]) {
+                throw "Backup config hash does not match original: $name"
+              }
+            }
+          } finally {
+            Stop-TestProcess -TargetExePath $currentExe
+          }
+
+      - name: 组装 release 目录
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Join-Chars {
+            param([int[]]$Codes)
+            return -join [char[]]$Codes
+          }
+
+          $appName = 'VS' + (Join-Chars @(0x632f, 0x5f26, 0x6570, 0x636e, 0x91c7, 0x96c6, 0x5668))
+          $newSuffix = Join-Chars @(0x65b0, 0x7248)
+          $losslessPackage = Join-Chars @(0x65e0, 0x635f, 0x5347, 0x7ea7, 0x5305)
+          $appExeName = $appName + '.exe'
+          $payloadExeName = $appName + '_' + $newSuffix + '.exe'
+          $zipName = $appName + '_' + $losslessPackage + '.zip'
+          $builtExe = Join-Path (Resolve-Path 'dist').Path $appExeName
+          $releaseDir = Join-Path (Get-Location) 'release'
+          $stageDir = Join-Path $env:RUNNER_TEMP ('vs-upgrade-package-' + [guid]::NewGuid().ToString('N'))
+
+          if (Test-Path -LiteralPath $releaseDir) {
+            Remove-Item -LiteralPath $releaseDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+          Copy-Item -LiteralPath $builtExe -Destination (Join-Path $releaseDir $appExeName) -Force
+          Copy-Item -LiteralPath $builtExe -Destination (Join-Path $stageDir $payloadExeName) -Force
+          Copy-Item -LiteralPath 'windows_upgrade\upgrade_vs_collector.cmd' -Destination $stageDir -Force
+          Copy-Item -LiteralPath 'windows_upgrade\upgrade_vs_collector.ps1' -Destination $stageDir -Force
+          $readme = Get-ChildItem -LiteralPath 'windows_upgrade' -Filter 'README*.md' -File | Select-Object -First 1
+          if (-not $readme) {
+            throw 'Missing upgrade README.'
+          }
+          Copy-Item -LiteralPath $readme.FullName -Destination $stageDir -Force
+
+          $zipPath = Join-Path $releaseDir $zipName
+          Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $zipPath -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $entries = @($zip.Entries | Where-Object { $_.FullName -and -not $_.FullName.EndsWith('/') } | ForEach-Object { $_.FullName })
+          } finally {
+            $zip.Dispose()
+          }
+
+          $requiredEntries = @(
+            $payloadExeName,
+            'upgrade_vs_collector.cmd',
+            'upgrade_vs_collector.ps1',
+            $readme.Name
+          )
+          if ($entries.Count -ne $requiredEntries.Count) {
+            throw "Unexpected ZIP entry count: $($entries -join ', ')"
+          }
+          foreach ($entry in $requiredEntries) {
+            if ($entries -notcontains $entry) {
+              throw "ZIP is missing required entry: $entry"
+            }
+          }
+          $forbiddenEntries = @($entries | Where-Object {
+            $_ -match '(^|/)(config\.env|sites\.json|formulas\.json)$' -or
+            $_ -match '\.(env|json)$'
+          })
+          if ($forbiddenEntries.Count -gt 0) {
+            throw "ZIP contains forbidden config entries: $($forbiddenEntries -join ', ')"
+          }
+
+          if ((Get-Item -LiteralPath (Join-Path $releaseDir $appExeName)).Length -le 0) {
+            throw 'Release EXE is zero bytes.'
+          }
+          if ((Get-Item -LiteralPath $zipPath).Length -le 0) {
+            throw 'Upgrade ZIP is zero bytes.'
+          }
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: VS振弦数据采集器
-          path: dist/VS振弦数据采集器.exe
+          name: VS振弦数据采集器-release
+          path: release/
+          if-no-files-found: error

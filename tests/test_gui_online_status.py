@@ -46,6 +46,18 @@ class FakeRoot:
         self.after_calls.append((delay, callback))
 
 
+class FakeDB:
+    def __init__(self):
+        self.snapshots = []
+
+    def is_connected(self):
+        return True
+
+    def insert_device_snapshot(self, **kwargs):
+        self.snapshots.append(kwargs)
+        return True
+
+
 def build_gui():
     gui = VSCollectorGUI.__new__(VSCollectorGUI)
     gui.devices = {}
@@ -100,6 +112,40 @@ class GUIOnlineStatusTests(unittest.TestCase):
         self.assertFalse(gui.devices['DEV_001']['online'])
         self.assertEqual(gui.tree.set('DEV_001', 'status'), '○ 离线')
         self.assertEqual(gui.root.after_calls[-1][0], 30000)
+
+    def test_empty_channel_packet_clears_previous_channel_values(self):
+        gui = build_gui()
+
+        gui._dev_data('DEV_001', {
+            'channels': [{
+                'channel': 1,
+                'frequency': 2220.3,
+                'temp': 20.9,
+                'data_quality': 'VALID',
+            }],
+        })
+        gui._dev_data('DEV_001', {'channels': []})
+
+        self.assertEqual(gui.devices['DEV_001']['channels'], {})
+        self.assertEqual(gui.tree.set('DEV_001', 'freq'), '')
+        self.assertEqual(gui.tree.set('DEV_001', 'temp'), '')
+        self.assertEqual(gui.tree.set('DEV_001', 'calc'), '')
+        self.assertEqual(gui.tree.set('DEV_001', 'quality'), 'NO_CHANNEL')
+
+    def test_empty_channel_snapshot_uses_no_channel_without_error_log(self):
+        gui = build_gui()
+        gui.db_manager = FakeDB()
+        logs = []
+        gui._log = lambda lv, msg: logs.append((lv, msg))
+
+        gui._dev_data('DEV_001', {'channels': [], 'signal': 25, 'voltage': 13.25})
+
+        self.assertEqual(gui.db_manager.snapshots[-1]['frequency'], None)
+        self.assertEqual(gui.db_manager.snapshots[-1]['temperature'], None)
+        self.assertEqual(gui.db_manager.snapshots[-1]['pressure'], None)
+        self.assertEqual(gui.db_manager.snapshots[-1]['water_level'], None)
+        self.assertEqual(gui.db_manager.snapshots[-1]['status'], 'NO_CHANNEL')
+        self.assertFalse(any(lv == 'ERROR' and '入库失败' in msg for lv, msg in logs))
 
 
 if __name__ == '__main__':

@@ -627,6 +627,9 @@ class VSCollectorGUI:
             self.tree.set(udid, 'ip', addr)
 
         channels = data.get('channels', [])
+        if not channels:
+            dev['channels'] = {}
+            self._log('WARN', f'  └ 未解析到通道数据: {udid}，已清空旧频率/温度显示')
         for ch in channels:
             cn = ch.get('channel', 0)
             freq = ch.get('frequency')
@@ -715,7 +718,7 @@ class VSCollectorGUI:
             f"{fs(ch1.get('calc'),4)}" if ch1 else '',
             fs(ch1.get('water'), 4) if ch1 else '',
             fs(ch1.get('water_elevation'), 4) if ch1 else '',
-            ch1.get('quality', '-') if ch1 else '',
+            ch1.get('quality', '-') if ch1 else 'NO_CHANNEL',
             refresh_ts,
         )
         try:
@@ -740,9 +743,11 @@ class VSCollectorGUI:
                     pressure=ch1.get('calc') if ch1 else None,
                     water_level=ch1.get('water') if ch1 else None,
                     elevation=ch1.get('water_elevation') if ch1 else None,
-                    status=ch1.get('quality', 'VALID') if ch1 else None,
+                    status=ch1.get('quality', 'VALID') if ch1 else 'NO_CHANNEL',
                 )
-                self._log('INFO', f'入库成功: {udid} P水压={ch1.get("calc")} 水位={ch1.get("water")}')
+                pressure = ch1.get('calc') if ch1 else None
+                water = ch1.get('water') if ch1 else None
+                self._log('INFO', f'入库成功: {udid} P水压={pressure} 水位={water}')
             except Exception as e:
                 self._log('ERROR', f'入库失败 {udid}: {e}')
 

@@ -13,6 +13,8 @@ logs/
 
 # 配置（含敏感信息）
 config.env
+sites.json
+formulas.json
 *.env
 
 # IDE
