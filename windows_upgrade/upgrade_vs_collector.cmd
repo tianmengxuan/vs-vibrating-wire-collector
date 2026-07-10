@@ -1,25 +1,22 @@
 @echo off
-chcp 65001 >nul
 setlocal
 
-cd /d "%~dp0"
+set "SCRIPT_FILE=%~dp0upgrade_vs_collector.ps1"
+set "LOG_FILE=%~dp0upgrade_vs_collector.log"
 
 where powershell.exe >nul 2>nul
 if errorlevel 1 (
-    echo [升级] 未找到 powershell.exe，无法执行升级。
-    pause
+    echo [upgrade] PowerShell is not available.
     exit /b 1
 )
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0upgrade_vs_collector.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_FILE%" >nul 2>&1
 set "EXIT_CODE=%ERRORLEVEL%"
 
-echo.
 if "%EXIT_CODE%"=="0" (
-    echo [升级] 升级流程完成。
+    echo [upgrade] Upgrade completed successfully.
 ) else (
-    echo [升级] 升级流程未完成，退出码：%EXIT_CODE%
+    echo [upgrade] Upgrade failed. Exit code: %EXIT_CODE%. See upgrade_vs_collector.log.
 )
 
-pause
 exit /b %EXIT_CODE%

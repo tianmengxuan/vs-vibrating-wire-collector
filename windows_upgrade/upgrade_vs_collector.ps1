@@ -1,17 +1,38 @@
-﻿# VS Collector Windows in-place upgrade script.
-# Saved as UTF-8 BOM so Windows PowerShell 5.1 reads Chinese EXE names correctly.
-# Put this script, upgrade_vs_collector.cmd, and VS振弦数据采集器_新版.exe
-# in the existing program directory, then run the .cmd file.
+# VS Collector Windows in-place upgrade script.
+# This file is intentionally ASCII-only for Windows PowerShell 5.1.
 
 $ErrorActionPreference = 'Stop'
 
-$appExeName = 'VS振弦数据采集器.exe'
-$payloadExeName = 'VS振弦数据采集器_新版.exe'
+$payloadExeName = 'VSCollector_Update.exe'
 $configFileNames = @('config.env', 'sites.json', 'formulas.json')
+$scriptDir = if ($PSScriptRoot) {
+    $PSScriptRoot
+} else {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+$scriptDir = [System.IO.Path]::GetFullPath($scriptDir)
+$logFilePath = Join-Path $scriptDir 'upgrade_vs_collector.log'
 
-function Write-Step {
+try {
+    [System.IO.File]::WriteAllText($logFilePath, '', [System.Text.Encoding]::ASCII)
+} catch {
+}
+
+function Write-Status {
     param([string]$Message)
-    Write-Host "[升级] $Message"
+    try {
+        $line = '[upgrade] ' + $Message + [System.Environment]::NewLine
+        [System.IO.File]::AppendAllText($script:logFilePath, $line, [System.Text.Encoding]::ASCII)
+    } catch {
+    }
+}
+
+function Get-AppExeName {
+    $codePoints = @(0x632f, 0x5f26, 0x6570, 0x636e, 0x91c7, 0x96c6, 0x5668)
+    $characters = foreach ($codePoint in $codePoints) {
+        [char]$codePoint
+    }
+    return 'VS' + (-join $characters) + '.exe'
 }
 
 function Get-NormalizedPath {
@@ -35,7 +56,7 @@ function Test-AppRunning {
             return $true
         }
     } catch {
-        Write-Step '无法精确读取进程路径，改用进程名做保守检测。'
+        Write-Status 'Exact process-path check unavailable; using process-name check.'
     }
 
     $processName = [System.IO.Path]::GetFileNameWithoutExtension($ExpectedExeName)
@@ -54,9 +75,6 @@ function Copy-IfExists {
 
     if (Test-Path -LiteralPath $SourcePath -PathType Leaf) {
         Copy-Item -LiteralPath $SourcePath -Destination $BackupDir -Force
-        Write-Step "已备份 $([System.IO.Path]::GetFileName($SourcePath))"
-    } else {
-        Write-Step "未找到 $([System.IO.Path]::GetFileName($SourcePath))，跳过该文件备份"
     }
 }
 
@@ -81,78 +99,84 @@ function Restore-OldExe {
     }
 }
 
-$scriptDir = if ($PSScriptRoot) {
-    $PSScriptRoot
-} else {
-    Split-Path -Parent $MyInvocation.MyCommand.Path
-}
-$scriptDir = [System.IO.Path]::GetFullPath($scriptDir)
-Set-Location -LiteralPath $scriptDir
+function Invoke-Upgrade {
+    $appExeName = Get-AppExeName
+    Set-Location -LiteralPath $scriptDir
 
-$currentExePath = Join-Path $scriptDir $appExeName
-$payloadExePath = Join-Path $scriptDir $payloadExeName
+    $currentExePath = Join-Path $scriptDir $appExeName
+    $payloadExePath = Join-Path $scriptDir $payloadExeName
 
-Write-Step "当前程序目录: $scriptDir"
+    Write-Status 'Upgrade started.'
 
-if ($payloadExeName -ieq $appExeName) {
-    Write-Host '[升级] 新版载荷文件名不能与旧 EXE 相同。'
-    exit 1
-}
-
-if (-not (Test-Path -LiteralPath $currentExePath -PathType Leaf)) {
-    Write-Host "[升级] 未找到旧版 EXE: $currentExePath"
-    Write-Host '[升级] 请把升级脚本放到现有程序目录后再运行。'
-    exit 1
-}
-
-if (-not (Test-Path -LiteralPath $payloadExePath -PathType Leaf)) {
-    Write-Host "[升级] 未找到新版载荷: $payloadExePath"
-    Write-Host "[升级] 请将新版 EXE 重命名为 $payloadExeName 后放到同一目录。"
-    exit 1
-}
-
-if ((Get-Item -LiteralPath $payloadExePath).Length -le 0) {
-    Write-Host '[升级] 新版载荷大小为 0，停止升级。'
-    exit 1
-}
-
-if (Test-AppRunning -TargetExePath $currentExePath -ExpectedExeName $appExeName) {
-    Write-Host '[升级] 检测到程序仍在运行。'
-    Write-Host '[升级] 请先正常关闭 VS振弦数据采集器，再重新运行升级脚本。'
-    exit 2
-}
-
-$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-$backupDir = Join-Path $scriptDir "upgrade_backup_$timestamp"
-New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-
-$backupExePath = Join-Path $backupDir $appExeName
-Copy-Item -LiteralPath $currentExePath -Destination $backupExePath -Force
-Write-Step "已备份旧 EXE 到: $backupDir"
-
-foreach ($configFileName in $configFileNames) {
-    Copy-IfExists -SourcePath (Join-Path $scriptDir $configFileName) -BackupDir $backupDir
-}
-
-$tempOldExe = Join-Path $scriptDir "$appExeName.replacing_$timestamp.bak"
-
-try {
-    Write-Step '开始替换 EXE，配置文件不会被覆盖或修改。'
-    Move-Item -LiteralPath $currentExePath -Destination $tempOldExe -Force
-    Copy-Item -LiteralPath $payloadExePath -Destination $currentExePath -Force
-
-    if ((-not (Test-Path -LiteralPath $currentExePath -PathType Leaf)) -or
-        ((Get-Item -LiteralPath $currentExePath).Length -le 0)) {
-        throw '替换后的 EXE 不存在或大小为 0。'
+    if ($payloadExeName -ieq $appExeName) {
+        Write-Status 'Payload name conflicts with the installed executable.'
+        return 1
     }
 
-    Remove-Item -LiteralPath $tempOldExe -Force -ErrorAction SilentlyContinue
-    Write-Step '升级成功，正在启动新版程序。'
-    Start-Process -FilePath $currentExePath -WorkingDirectory $scriptDir
-    exit 0
-} catch {
-    Write-Host "[升级] 替换失败: $($_.Exception.Message)"
-    Restore-OldExe -TempOldExe $tempOldExe -CurrentExePath $currentExePath -BackupExePath $backupExePath
-    Write-Host '[升级] 已尝试恢复旧版 EXE。config.env、sites.json、formulas.json 未被修改。'
-    exit 1
+    if (-not (Test-Path -LiteralPath $currentExePath -PathType Leaf)) {
+        Write-Status 'Installed executable was not found.'
+        return 1
+    }
+
+    if (-not (Test-Path -LiteralPath $payloadExePath -PathType Leaf)) {
+        Write-Status 'Update payload was not found.'
+        return 1
+    }
+
+    if ((Get-Item -LiteralPath $payloadExePath).Length -le 0) {
+        Write-Status 'Update payload is empty.'
+        return 1
+    }
+
+    if (Test-AppRunning -TargetExePath $currentExePath -ExpectedExeName $appExeName) {
+        Write-Status 'The installed application is still running. Close it and retry.'
+        return 2
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $backupDir = Join-Path $scriptDir ('upgrade_backup_' + $timestamp)
+    [System.IO.Directory]::CreateDirectory($backupDir) | Out-Null
+
+    $backupExePath = Join-Path $backupDir $appExeName
+    Copy-Item -LiteralPath $currentExePath -Destination $backupExePath -Force
+
+    foreach ($configFileName in $configFileNames) {
+        Copy-IfExists -SourcePath (Join-Path $scriptDir $configFileName) -BackupDir $backupDir
+    }
+    Write-Status 'Backup completed.'
+
+    $tempOldExe = Join-Path $scriptDir ($appExeName + '.replacing_' + $timestamp + '.bak')
+
+    try {
+        Move-Item -LiteralPath $currentExePath -Destination $tempOldExe -Force
+        Copy-Item -LiteralPath $payloadExePath -Destination $currentExePath -Force
+
+        if ((-not (Test-Path -LiteralPath $currentExePath -PathType Leaf)) -or
+            ((Get-Item -LiteralPath $currentExePath).Length -le 0)) {
+            throw 'Replacement validation failed.'
+        }
+
+        Start-Process -FilePath $currentExePath -WorkingDirectory $scriptDir
+        Remove-Item -LiteralPath $tempOldExe -Force -ErrorAction SilentlyContinue
+        Write-Status 'Upgrade completed and the application was started.'
+        return 0
+    } catch {
+        Write-Status 'Replacement failed. Restoring the installed executable.'
+        try {
+            Restore-OldExe -TempOldExe $tempOldExe -CurrentExePath $currentExePath -BackupExePath $backupExePath
+            Write-Status 'Rollback completed. Configuration files were not changed.'
+        } catch {
+            Write-Status 'Rollback could not be completed automatically. Use the backup directory.'
+        }
+        return 1
+    }
 }
+
+try {
+    $exitCode = Invoke-Upgrade
+} catch {
+    Write-Status 'Upgrade failed before replacement. No error details were printed.'
+    $exitCode = 1
+}
+
+exit $exitCode

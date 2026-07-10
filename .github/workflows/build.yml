@@ -63,10 +63,18 @@ jobs:
             }
           }
 
+          function Test-AsciiFile {
+            param([string]$Path)
+
+            $nonAsciiBytes = @([System.IO.File]::ReadAllBytes($Path) | Where-Object { $_ -gt 0x7F })
+            if ($nonAsciiBytes.Count -gt 0) {
+              throw "Execution script is not ASCII-only: $Path"
+            }
+          }
+
           $appName = 'VS' + (Join-Chars @(0x632f, 0x5f26, 0x6570, 0x636e, 0x91c7, 0x96c6, 0x5668))
-          $newSuffix = Join-Chars @(0x65b0, 0x7248)
           $appExeName = $appName + '.exe'
-          $payloadExeName = $appName + '_' + $newSuffix + '.exe'
+          $payloadExeName = 'VSCollector_Update.exe'
           $builtExe = Join-Path (Resolve-Path 'dist').Path $appExeName
           if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
             throw "Missing built EXE for smoke test: $builtExe"
@@ -82,6 +90,8 @@ jobs:
           Copy-Item -LiteralPath $builtExe -Destination $payloadExe -Force
           Copy-Item -LiteralPath 'windows_upgrade\upgrade_vs_collector.ps1' -Destination $smokeDir -Force
           Copy-Item -LiteralPath 'windows_upgrade\upgrade_vs_collector.cmd' -Destination $smokeDir -Force
+          Test-AsciiFile -Path (Join-Path $smokeDir 'upgrade_vs_collector.cmd')
+          Test-AsciiFile -Path (Join-Path $smokeDir 'upgrade_vs_collector.ps1')
 
           $siteName = Join-Chars @(0x6d4b, 0x8bd5, 0x7ad9, 0x70b9)
           $note = Join-Chars @(0x4e2d, 0x6587, 0x914d, 0x7f6e, 0x5185, 0x5bb9)
@@ -106,10 +116,22 @@ jobs:
           $oldExeHash = (Get-FileHash -LiteralPath $currentExe -Algorithm SHA256).Hash
 
           try {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $smokeDir 'upgrade_vs_collector.ps1')
-            if ($LASTEXITCODE -ne 0) {
-              throw "Upgrade smoke test failed with exit code $LASTEXITCODE"
+            Push-Location -LiteralPath $smokeDir
+            try {
+              & $env:ComSpec /d /c 'call upgrade_vs_collector.cmd'
+              $cmdExitCode = $LASTEXITCODE
+            } finally {
+              Pop-Location
             }
+            if ($cmdExitCode -ne 0) {
+              throw "Upgrade CMD smoke test failed with exit code $cmdExitCode"
+            }
+
+            $upgradeLog = Join-Path $smokeDir 'upgrade_vs_collector.log'
+            if (-not (Test-Path -LiteralPath $upgradeLog -PathType Leaf)) {
+              throw 'Upgrade CMD did not create its status log.'
+            }
+            Test-AsciiFile -Path $upgradeLog
 
             Start-Sleep -Seconds 2
 
@@ -166,10 +188,9 @@ jobs:
           }
 
           $appName = 'VS' + (Join-Chars @(0x632f, 0x5f26, 0x6570, 0x636e, 0x91c7, 0x96c6, 0x5668))
-          $newSuffix = Join-Chars @(0x65b0, 0x7248)
           $losslessPackage = Join-Chars @(0x65e0, 0x635f, 0x5347, 0x7ea7, 0x5305)
           $appExeName = $appName + '.exe'
-          $payloadExeName = $appName + '_' + $newSuffix + '.exe'
+          $payloadExeName = 'VSCollector_Update.exe'
           $zipName = $appName + '_' + $losslessPackage + '.zip'
           $builtExe = Join-Path (Resolve-Path 'dist').Path $appExeName
           $releaseDir = Join-Path (Get-Location) 'release'
@@ -214,6 +235,11 @@ jobs:
           foreach ($entry in $requiredEntries) {
             if ($entries -notcontains $entry) {
               throw "ZIP is missing required entry: $entry"
+            }
+          }
+          foreach ($entry in $entries) {
+            if (($entry -ne $readme.Name) -and ($entry -notmatch '^[\x00-\x7F]+$')) {
+              throw "ZIP execution filename is not ASCII: $entry"
             }
           }
           $forbiddenEntries = @($entries | Where-Object {
